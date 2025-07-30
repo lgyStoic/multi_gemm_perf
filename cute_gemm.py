@@ -132,7 +132,7 @@ def parse_arguments() -> argparse.Namespace:
         "--tile_shape_mnk",
         type=parse_comma_separated_ints,
         choices=[(128, 128, 64), (128, 256, 64), (128, 64, 64), (64, 64, 64)],
-        default=(128, 128, 64),
+        default=(128, 256, 64),
         help="Cta tile shape (comma-separated)",
     )
     parser.add_argument(
@@ -169,12 +169,12 @@ def parse_arguments() -> argparse.Namespace:
         "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
     )
     parser.add_argument(
-        "--warmup_iterations", type=int, default=0, help="Warmup iterations"
+        "--warmup_iterations", type=int, default=10, help="Warmup iterations"
     )
     parser.add_argument(
         "--iterations",
         type=int,
-        default=1,
+        default=100,
         help="Number of iterations to run the kernel",
     )
     parser.add_argument(
@@ -1503,6 +1503,15 @@ def run(
         end_time = time.perf_counter()
         times.append((end_time - start_time) * 1000)  # milliseconds
     avg_time = np.mean(times)
+
+    # Check mC is correct
+    # Compute reference result using torch
+    print(f"a_torch.shape: {a_torch.shape}, b_torch.shape: {b_torch.shape}")
+    print(f"mA.shape: {mA.shape}, mB.shape: {mB.shape}, mC.shape: {mC.shape}")
+    ref = (torch.einsum("mkl,nkl->mnl", a, b)).cpu()
+    ref_c = ref.to(cutlass_torch.dtype(c_dtype))
+
+    torch.testing.assert_close(c_torch.cpu(), ref_c, atol=tolerance, rtol=1e-03)
 
     m, n, k, l = mnkl
     tflops = (2 * m * n * k) / ((avg_time / 1000) * 1e12)
