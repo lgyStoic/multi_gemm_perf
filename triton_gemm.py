@@ -153,12 +153,14 @@ import torch
 
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+# Use torch device instead of triton runtime API
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def is_cuda():
-    return triton.runtime.driver.active.get_current_target().backend == "cuda"
+    return torch.cuda.is_available()
 
 
 def get_cuda_autotune_config():
@@ -375,11 +377,12 @@ if __name__ == "__main__":
         torch.manual_seed(0)
         a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
         b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
+        triton_output = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
         a = a.to(torch.float8_e5m2)
         # pre-transpose b for efficiency.
         b = b.T
         b = b.to(torch.float8_e5m2)
-        triton_output = matmul(a, b)
+        matmul(a, b, triton_output)
         torch_output = torch.matmul(a.to(torch.float16), b.to(torch.float16))
         print(f"triton_output_with_fp8_inputs={triton_output}")
         print(f"torch_output_with_fp8_inputs={torch_output}")
@@ -407,7 +410,7 @@ if __name__ == "__main__":
         configs.append(
             triton.testing.Benchmark(
                 x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
-                x_vals=[256 * i for i in range(60, 65)],
+                x_vals=[256 * i for i in range(20, 40)],
                 line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
                 # Possible values for `line_arg`
                 # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
@@ -425,6 +428,10 @@ if __name__ == "__main__":
     def benchmark(M, N, K, provider, fp8_inputs):
         a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
         b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+        # c = torch.randn((M, N), device=DEVICE, dtype=torch.float16)
+        # a = torch.randint(3, 7, (M, K), device='cuda').to(torch.float16)
+        # b = torch.randint(2, 6, (K, N), device='cuda').to(torch.float16)
+        c = torch.zeros((M, N), device=DEVICE, dtype=torch.float16)
         if TORCH_HAS_FP8 and fp8_inputs:
             a = a.to(torch.float8_e5m2)
             b = b.T
@@ -433,7 +440,7 @@ if __name__ == "__main__":
         if provider == ref_lib.lower():
             ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
         if provider == 'triton':
-            ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles)
+            ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b, c), quantiles=quantiles)
         perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
         return perf(ms), perf(max_ms), perf(min_ms)
     
