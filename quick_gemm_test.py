@@ -146,6 +146,8 @@ def benchmark_triton(M, N, K, dtype: torch.dtype,
     
     base_name = "Triton" if not using_tma else "Triton TMA"
     full_name = f"{base_name} {'persistent' if using_persistent else ''}"
+    if using_persistent:
+        full_name += " no ws" if not warp_specialize else ""
     return {
         "name": full_name,
         "avg_time_ms": avg_time,
@@ -262,11 +264,18 @@ def run_quick_test(sizes: List[int], dtype: torch.dtype = torch.float16, iterati
         all_results.append(triton_tma_result)
 
         triton_tma_persistent_result = benchmark_triton(M, N, K, dtype, 
-                warp_specialize=False, 
+                warp_specialize=True, 
                 using_tma=True, 
                 using_persistent=True, 
                 iterations=iterations)
         all_results.append(triton_tma_persistent_result)
+
+        triton_tma_persistent_without_warp_specialize_result = benchmark_triton(M, N, K, dtype, 
+                warp_specialize=False, 
+                using_tma=True, 
+                using_persistent=True, 
+                iterations=iterations)
+        all_results.append(triton_tma_persistent_without_warp_specialize_result)
 
         # Test CUTE DSL
         cute_result = benchmark_cute(M, N, K, dtype, iterations)
@@ -280,11 +289,18 @@ def run_quick_test(sizes: List[int], dtype: torch.dtype = torch.float16, iterati
         print(f"\nResults for {M}x{N}x{K}:")
         print("-" * 40)
         
-        results_for_size = [r for r in [pytorch_result, triton_result, triton_tma_result, triton_tma_persistent_result, cute_result, cute_cpp_result] if "error" not in r]
+        results_for_size = [r for r in [pytorch_result, 
+            triton_result, 
+            triton_tma_result, 
+            triton_tma_persistent_result, 
+            triton_tma_persistent_without_warp_specialize_result, 
+            cute_result, 
+            cute_cpp_result] if "error" not in r]
+
         results_for_size.sort(key=lambda x: x["tflops"], reverse=True)
         
         for i, result in enumerate(results_for_size):
-            rank = f"{i+1}." if i < 3 else "  "
+            rank = f"{i+1}."
             print(f"{rank} {result['name']:10s}: {result['avg_time_ms']:8.2f} ms, "
                   f"{result['tflops']:6.2f} TFLOPS")
         
