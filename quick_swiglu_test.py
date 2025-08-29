@@ -7,16 +7,13 @@ def torch_swiglu_ref(x: torch.Tensor, w: torch.Tensor):
     y1 = torch.matmul(x, w1)
     y2 = torch.matmul(x, w2)
     p2 = y2 * torch.sigmoid(y2)
-    y = y1 * y2
+    y = y1 * p2
     return y
 
 # Try to import triton_swiglu and cute_gemm if available
 try:
     from triton_swiglu import apply_fused_linear_swiglu
     TRITON_SWIGLU_AVAILABLE = True
-    import sys
-    if sys.version_info[:2] != (3, 13):
-        TRITON_SWIGLU_AVAILABLE = False
 except ImportError:
     TRITON_SWIGLU_AVAILABLE = False
 
@@ -50,8 +47,15 @@ def benchmark_swiglu_triton(x, weight, iterations=100):
     # x: [B, in_features], weight: [in_features, 2*out_features]
     if not TRITON_SWIGLU_AVAILABLE:
         raise RuntimeError("Triton swiglu not available")
-    from triton_swiglu import perf_swiglu, setup_autotune
-    setup_autotune()
+    from triton_swiglu import perf_swiglu
+    avg_time = perf_swiglu(x, weight, iterations=iterations)
+    return avg_time
+
+def benchmark_swiglu_tma_triton(x, weight, iterations=100):
+    # x: [B, in_features], weight: [in_features, 2*out_features]
+    if not TRITON_SWIGLU_AVAILABLE:
+        raise RuntimeError("Triton swiglu not available")
+    from triton_tma_swiglu import perf_swiglu
     avg_time = perf_swiglu(x, weight, iterations=iterations)
     return avg_time
 
@@ -60,31 +64,34 @@ def benchmark_swiglu_torch(x, weight, iterations=100):
     if not TORCH_SWIGLU_AVAILABLE:
         raise RuntimeError("Torch swiglu not available")
     # warmup
-    for _ in range(1):
+    for _ in range(10):
         torch_swiglu_ref(x, weight)
     # run
-    import time
-    times = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start.record()
     for _ in range(iterations):
-        start_time = time.perf_counter()
         torch_swiglu_ref(x, weight)
-        torch.cuda.synchronize()
-        end_time = time.perf_counter()
-        times.append((end_time - start_time) * 1000)
-    avg_time = np.mean(times)
-    return avg_time
+    end.record()
+    torch.cuda.synchronize()
+    cost = start.elapsed_time(end)
+    return cost / iterations
 
 def benchmark(x, weight, iterations=1000):
+    torch.set_grad_enabled(False)
     cute_time = None
     triton_time = None
     print("-"*100)
     print(f"B={x.shape[0]}, in={x.shape[1]}, out={weight.shape[1]}, dtype={x.dtype}")
     if TRITON_SWIGLU_AVAILABLE:
         triton_time = benchmark_swiglu_triton(x, weight, iterations=iterations)
-        print(f"Triton: {triton_time:.3f} ms")
-    if CUTE_AVAILABLE:
-        cute_time = benchmark_swiglu_cute(x, weight.t(), iterations=iterations)
-        print(f"CUTE: {cute_time:.3f} ms")
+        print(f"Triton normal: {triton_time:.3f} ms")
+        triton_tma_time = benchmark_swiglu_tma_triton(x, weight, iterations=iterations)
+        print(f"Triton persistent TMA: {triton_tma_time:.3f} ms")
+    # if CUTE_AVAILABLE:
+    #     cute_time = benchmark_swiglu_cute(x, weight.t(), iterations=iterations)
+    #     print(f"CUTE: {cute_time:.3f} ms")
     torch_time = benchmark_swiglu_torch(x, weight, iterations=iterations)
     print(f"Torch: {torch_time:.3f} ms")
 

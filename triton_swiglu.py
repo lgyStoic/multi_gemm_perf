@@ -102,6 +102,10 @@ def get_autotune_config():
     ]
 
 
+@triton.autotune(
+    configs=get_autotune_config(),
+    key=["M", "N", "K"],
+)
 @triton.jit
 def _matmul_kernel(
     # Pointers to matrices
@@ -428,29 +432,22 @@ def apply_fused_linear_swiglu(
     return y
 
 
-def setup_autotune():
-    global SWIGLU_MATMUL
-    SWIGLU_MATMUL = triton.autotune(
-        configs=get_autotune_config(),
-        key=["M", "N", "K"],
-    )(_matmul_kernel)
 
 def perf_swiglu(x: torch.Tensor,
                 w: torch.Tensor,
-                warmup_iterations: int = 1,
+                warmup_iterations: int = 10,
                 iterations: int = 100):
     # warmup
     for _ in range(warmup_iterations):
         apply_fused_linear_swiglu(x, w)
 
     # run
-    times = []
-    import time
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
     for _ in range(iterations):
-        start_time = time.perf_counter()
         apply_fused_linear_swiglu(x, w)
-        torch.cuda.synchronize()
-        end_time = time.perf_counter()
-        times.append((end_time - start_time) * 1000)
-    avg_time = np.mean(times)
+    end.record()
+    torch.cuda.synchronize()
+    avg_time = start.elapsed_time(end) / iterations
     return avg_time
