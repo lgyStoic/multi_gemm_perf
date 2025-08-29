@@ -112,10 +112,11 @@ def _matmul_with_base_kernel(
 def matmul(a, b, c):
     M, K = a.shape
     K, N = b.shape
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"])
-        * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
+    def grid(META):
+        BLOCK_M = META["BLOCK_SIZE_M"]
+        BLOCK_N = META["BLOCK_SIZE_N"]
+        return (min(NUM_SMS, triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)), )
+
     # Set up memory allocator for TMA descriptors
     def alloc_fn(size: int, alignment: int, stream: Optional[int]):
         return torch.empty(size, device="cuda", dtype=torch.int8)
