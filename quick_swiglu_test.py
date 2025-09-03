@@ -78,7 +78,7 @@ def benchmark_swiglu_torch(x, weight, iterations=100):
     cost = start.elapsed_time(end)
     return cost / iterations
 
-def benchmark(x, weight, iterations=1000):
+def benchmark(x, weight, iterations=100):
     torch.set_grad_enabled(False)
     cute_time = None
     triton_time = None
@@ -95,7 +95,6 @@ def benchmark(x, weight, iterations=1000):
     torch_time = benchmark_swiglu_torch(x, weight, iterations=iterations)
     print(f"Torch: {torch_time:.3f} ms")
 
-
 def main():
     torch.manual_seed(0)
     B = 4096
@@ -108,7 +107,22 @@ def main():
 
     print(f"Testing SWIGLU performance: B={B}, in={in_features}, out={out_features}, dtype={dtype}")
 
-    benchmark(x, weight)
+    # Benchmark multiple shapes
+    shapes = [
+        (4096, 4096, 4096 * 3),
+        (2048, 4096, 4096 * 3),
+        (4096, 2048, 2048 * 3),
+        (1024, 1024, 1024 * 3),
+        (512, 4096, 4096 * 3),
+        (4096, 512, 512 * 3),
+        (8192, 4096, 4096 * 3),
+        (4096, 8192, 8192 * 3),
+    ]
+    dtype = torch.float16
+    for B, in_features, out_features in shapes:
+        x = torch.randn(B, in_features, device="cuda", dtype=dtype)
+        weight = torch.randn(in_features, 2*out_features, device="cuda", dtype=dtype)
+        benchmark(x, weight)
 
 
 if __name__ == "__main__":
