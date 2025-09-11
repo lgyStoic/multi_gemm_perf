@@ -326,7 +326,7 @@ def calc_gemm(x_ptr, w_ptr, t_ptr,
         t_desc.store([offs_am, offs_bn], t)
 
 @triton.autotune(
-    configs=[triton.Config({'GROUP_SIZE_M': g}) for g in [2, 4, 8, 16]],
+    configs=[triton.Config({'GROUP_SIZE_M': g}) for g in [1, 2, 4, 8, 16, 32, 64]],
     key=["M", "N", "N_2"],
 )
 @triton.jit
@@ -340,36 +340,36 @@ def calc_t_swiglu_partial(t_ptr, grad_y_ptr, grad_swiglu_ptr,
     calc t swiglu partial
     """
     pid = tl.program_id(axis=0)
+        
     start_row = pid * GROUP_SIZE_M
     end_row = min(M, start_row + GROUP_SIZE_M)
     group_size = end_row - start_row
     y1_ptr = t_ptr + start_row * N
-    y2_ptr = t_ptr + start_row * N+ N_2
+    y2_ptr = t_ptr + start_row * N + N_2
     dy_dy1_ptr = grad_y_ptr + start_row * N
     dy_dy2_ptr = grad_y_ptr + start_row * N + N_2
-    grad_swiglu_ptr = grad_swiglu_ptr + start_row * N_2
+    grad_swiglu_tmp_ptr = grad_swiglu_ptr + start_row * N_2
     offset_n2 = tl.arange(0, POW_N_2)
     mask_n2 = offset_n2 < N_2
 
     for i in range(group_size):
-        y2 = tl.load(y2_ptr + offset_n2, mask=mask_n2)
         y1 = tl.load(y1_ptr + offset_n2, mask=mask_n2)
-        grad_swiglu = tl.load(grad_swiglu_ptr + offset_n2, mask=mask_n2)
-        grad_swiglu = 1.0
+        y2 = tl.load(y2_ptr + offset_n2, mask=mask_n2)
+        grad_swiglu = tl.load(grad_swiglu_tmp_ptr + offset_n2, mask=mask_n2)
         y2_sigmoid = tl.sigmoid(y2.to(tl.float32)).to(tl.float16)
         p2 = y2 * y2_sigmoid
         # Correct SwiGLU gradient computation:
         # For y1: grad_swiglu * p2 (where p2 = y2 * sigmoid(y2))
         # For y2: grad_swiglu * y1 * (sigmoid(y2) + y2 * sigmoid(y2) * (1 - sigmoid(y2)))
         grad_y1 = p2 * grad_swiglu
-        grad_y2 = y1 * (y2_sigmoid + p2 * (1.0 - y2_sigmoid)) * grad_swiglu
         tl.store(dy_dy1_ptr + offset_n2, grad_y1, mask=mask_n2)
+        grad_y2 = y1 * (y2_sigmoid + p2 * (1.0 - y2_sigmoid)) * grad_swiglu
         tl.store(dy_dy2_ptr + offset_n2, grad_y2, mask=mask_n2)
         y2_ptr += N
         y1_ptr += N
         dy_dy2_ptr += N
         dy_dy1_ptr += N
-        grad_swiglu_ptr += N_2
+        grad_swiglu_tmp_ptr += N_2
 
 @torch.library.custom_op("meshylearning::fused_linear_swiglu_grad", mutates_args=())
 def fused_linear_swiglu_grad(x: torch.Tensor,
@@ -381,12 +381,13 @@ def fused_linear_swiglu_grad(x: torch.Tensor,
     M, K = x.shape
     _, N = w.shape
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    t = torch.zeros(M, N, device="cuda", dtype=torch.float16)
-    grad_x = torch.zeros(M, K, device="cuda", dtype=torch.float16)
-    grad_w = torch.zeros(K, N, device="cuda", dtype=torch.float16)
-    grad_dt = torch.zeros(M, N, device="cuda", dtype=torch.float16)
+    device = x.device
+    t = torch.zeros(M, N, device=device, dtype=torch.float16)
+    grad_x = torch.zeros(M, K, device=device, dtype=torch.float16)
+    grad_w = torch.zeros(K, N, device=device, dtype=torch.float16)
+    grad_dt = torch.zeros(M, N, device=device, dtype=torch.float16)
     def alloc_fn(size: int, alignment: int, stream: Optional[int]):
-        return torch.empty(size, device="cuda", dtype=torch.int8)
+        return torch.empty(size, device=device, dtype=torch.int8)
     triton.set_allocator(alloc_fn)
     def grid(META):
         BLOCK_M = META["BLOCK_SIZE_M"]
@@ -399,18 +400,11 @@ def fused_linear_swiglu_grad(x: torch.Tensor,
     assert N % 2 == 0, "Matrix B must have an even number of columns"
     N_2 = N // 2
     POW_N_2 = triton.next_power_of_2(N_2)
-    print("M, N, N_2, POW_N_2:", M, N, N_2, POW_N_2)
-    calc_t_swiglu_partial[grid2](t, grad_dt, grad_swiglu, M, N, N_2, POW_N_2);
-    # torch.save(t, "t_2.pt")
-    # torch.save(grad_dt, "grad_dt_2.pt")
-    # torch.save(grad_swiglu, "grad_swiglu_2.pt")
-    # raise ValueError("Stop here")
+    calc_t_swiglu_partial[grid2](t, grad_dt, grad_swiglu.contiguous(), M, N, N_2, POW_N_2);
     # Use PyTorch's built-in matrix multiplication for simplicity
     # grad_w = x.t() @ grad_dt  (K x M) @ (M x N) = (K x N)
-    # grad_w_ref = torch.matmul(x.t(), grad_dt)
     calc_gemm[grid](x.t().contiguous(), grad_dt, grad_w, K, N, M, NUM_SMS)
     # grad_x = grad_dt @ w.t()  (M x N) @ (N x K) = (M x K)
-    # grad_x = torch.matmul(grad_dt, w.t())
     calc_gemm[grid](grad_dt, w.t().contiguous(), grad_x, M, K, N, NUM_SMS)
     return grad_x, grad_w
 
@@ -420,8 +414,7 @@ def _fused_linear_swiglu_backward(ctx, grad_swiglu):
 
     return grad_x, grad_w
 
-# @torch.library.register_fake("meshylearning::fused_linear_swiglu_grad")
-@fused_linear_swiglu_grad.register_fake
+@torch.library.register_fake("meshylearning::fused_linear_swiglu_grad")
 def _(x: torch.Tensor, w: torch.Tensor, grad_swiglu: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if x.ndim == 3:
         x = x.view(-1, x.shape[-1])
@@ -451,15 +444,26 @@ def perf_swiglu(x: torch.Tensor,
     for _ in range(warmup_iterations):
         _fused_linear_swiglu(x, w)
     # measure
-    torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
     start.record()
     for _ in range(iterations):
         _fused_linear_swiglu(x, w)
     end.record()
     torch.cuda.synchronize()
-    return start.elapsed_time(end) / iterations
+    fwd_time = start.elapsed_time(end) / iterations
+    y = _fused_linear_swiglu(x, w)
+    for _ in range(warmup_iterations):
+        fused_linear_swiglu_grad(x, w, torch.ones_like(y))
+    torch.cuda.synchronize()
+    start.record()
+    for _ in range(iterations):
+        fused_linear_swiglu_grad(x, w, torch.ones_like(y))
+    end.record()
+    torch.cuda.synchronize()
+    bwd_time = start.elapsed_time(end) / iterations
+    return fwd_time, bwd_time
 
 def validate_swiglu(x: torch.Tensor, w: torch.Tensor):
     w_autograd = w.clone().requires_grad_()
@@ -473,13 +477,18 @@ def validate_swiglu(x: torch.Tensor, w: torch.Tensor):
     p2 = y2 * torch.sigmoid(y2)
     y_ref = y1 * p2
     assert torch.allclose(y, y_ref, atol=1e-2, rtol=1e-2)
+    y.sum().backward(retain_graph=True)
+
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], record_shapes=True, profile_memory=True) as prof:
+        y.sum().backward(retain_graph=True)
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     y_ref.sum().backward()
-    y.sum().backward()
     assert torch.allclose(x_autograd.grad, x_autograd_1.grad, atol=1.0, rtol=1e-1)
     assert torch.allclose(w_autograd.grad, w_autograd_1.grad, atol=1.0, rtol=1e-1)
 
 if __name__ == "__main__":
     num = 512 
+    # torch.autograd.set_detect_anomaly(True)
     torch.manual_seed(0)
     x = torch.randn(num, num, device="cuda", dtype=torch.float16)
     w = torch.randn(num, num* 6, device="cuda", dtype=torch.float16)
