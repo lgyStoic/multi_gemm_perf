@@ -273,15 +273,20 @@ def apply_fused_linear_swiglu(
 )
 @triton.jit
 def calc_gemm(x_ptr, w_ptr, t_ptr,
-            M, N, K,
+            M, N, K, mode: tl.constexpr,
             NUM_SMS: tl.constexpr,
             WARP_SPECIALIZE: tl.constexpr,
             BLOCK_SIZE_M: tl.constexpr,
             BLOCK_SIZE_N: tl.constexpr,
             BLOCK_SIZE_K: tl.constexpr,
-            GROUP_SIZE_M: tl.constexpr,):
+            GROUP_SIZE_M: tl.constexpr):
     """
-    t = x @ w
+    t = x @ w, 
+    tensor is row major,
+    if NT, assume N is normal, T is transposed; else if TN, assume T is normal, N is transposed
+    if NT, x is N, w is T; so x is M, K, w is N, K
+    if TN, x is T, w is N; so x is K, M, w is K, N
+    if NN, x is N, w is N; so x is M, K, w is K, N
     """
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -290,24 +295,64 @@ def calc_gemm(x_ptr, w_ptr, t_ptr,
     num_tiles = num_pid_m * num_pid_n
 
     # Create tensor descriptors on device
-    x_desc = tl.make_tensor_descriptor(
-        x_ptr,
-        shape=[M, K],
-        strides=[K, 1],
-        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
-    )
-    w_desc = tl.make_tensor_descriptor(
-        w_ptr,
-        shape=[K, N],
-        strides=[N, 1],
-        block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
-    )
-    t_desc = tl.make_tensor_descriptor(
-        t_ptr,
-        shape=[M, N],
-        strides=[N, 1],
-        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-    )
+    if mode == "NN":
+        x_desc = tl.make_tensor_descriptor(
+            x_ptr,
+            shape=[M, K],
+            strides=[K, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
+        w_desc = tl.make_tensor_descriptor(
+            w_ptr,
+            shape=[K, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
+        )
+        t_desc = tl.make_tensor_descriptor(
+            t_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+    if mode == "TN":
+        x_desc = tl.make_tensor_descriptor(
+            x_ptr,
+            shape=[K, M],
+            strides=[M, 1],
+            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_M],
+        )
+        w_desc = tl.make_tensor_descriptor(
+            w_ptr,
+            shape=[K, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
+        )
+        t_desc = tl.make_tensor_descriptor(
+            t_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+    if mode == "NT":
+        x_desc = tl.make_tensor_descriptor(
+            x_ptr,
+            shape=[M, K],
+            strides=[K, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
+        w_desc = tl.make_tensor_descriptor(
+            w_ptr,
+            shape=[N, K],
+            strides=[K, 1],
+            block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+        )
+        t_desc = tl.make_tensor_descriptor(
+            t_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, warp_specialize=WARP_SPECIALIZE):
@@ -318,9 +363,18 @@ def calc_gemm(x_ptr, w_ptr, t_ptr,
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K
-            x = x_desc.load([offs_am, offs_k])
-            w = w_desc.load([offs_k, offs_bn])
-            accumulator = tl.dot(x, w, accumulator)
+            if mode == "NN":
+                x = x_desc.load([offs_am, offs_k])
+                w = w_desc.load([offs_k, offs_bn])
+                accumulator = tl.dot(x, w, accumulator)
+            elif mode == "NT":
+                x = x_desc.load([offs_am, offs_k])
+                w = w_desc.load([offs_bn, offs_k])
+                accumulator = tl.dot(x, tl.trans(w), accumulator)
+            elif mode == "TN":
+                x = x_desc.load([offs_k, offs_am])
+                w = w_desc.load([offs_k, offs_bn])
+                accumulator = tl.dot(tl.trans(x), w, accumulator)
 
         t = accumulator.to(tl.float16)
         t_desc.store([offs_am, offs_bn], t)
@@ -393,7 +447,7 @@ def fused_linear_swiglu_grad(x: torch.Tensor,
         BLOCK_M = META["BLOCK_SIZE_M"]
         BLOCK_N = META["BLOCK_SIZE_N"]
         return (min(NUM_SMS, triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)), )
-    calc_gemm[grid](x, w, t, M, N, K, NUM_SMS)
+    calc_gemm[grid](x, w, t, M, N, K, "NN", NUM_SMS)
     def grid2(META):
         GROUP_SIZE_M = META["GROUP_SIZE_M"]
         return (triton.cdiv(M, GROUP_SIZE_M), )
@@ -403,9 +457,9 @@ def fused_linear_swiglu_grad(x: torch.Tensor,
     calc_t_swiglu_partial[grid2](t, grad_dt, grad_swiglu.contiguous(), M, N, N_2, POW_N_2);
     # Use PyTorch's built-in matrix multiplication for simplicity
     # grad_w = x.t() @ grad_dt  (K x M) @ (M x N) = (K x N)
-    calc_gemm[grid](x.t().contiguous(), grad_dt, grad_w, K, N, M, NUM_SMS)
+    calc_gemm[grid](x, grad_dt, grad_w, K, N, M, "TN", NUM_SMS)
     # grad_x = grad_dt @ w.t()  (M x N) @ (N x K) = (M x K)
-    calc_gemm[grid](grad_dt, w.t().contiguous(), grad_x, M, K, N, NUM_SMS)
+    calc_gemm[grid](grad_dt, w, grad_x, M, K, N, "NT", NUM_SMS)
     return grad_x, grad_w
 
 def _fused_linear_swiglu_backward(ctx, grad_swiglu):
@@ -479,9 +533,9 @@ def validate_swiglu(x: torch.Tensor, w: torch.Tensor):
     assert torch.allclose(y, y_ref, atol=1e-2, rtol=1e-2)
     y.sum().backward(retain_graph=True)
 
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], record_shapes=True, profile_memory=True) as prof:
-        y.sum().backward(retain_graph=True)
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    # with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], record_shapes=True, profile_memory=True) as prof:
+    #     y.sum().backward(retain_graph=True)
+    # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     y_ref.sum().backward()
     assert torch.allclose(x_autograd.grad, x_autograd_1.grad, atol=1.0, rtol=1e-1)
     assert torch.allclose(w_autograd.grad, w_autograd_1.grad, atol=1.0, rtol=1e-1)
