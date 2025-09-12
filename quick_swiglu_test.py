@@ -48,52 +48,67 @@ def benchmark_swiglu_triton(x, weight, iterations=100):
     if not TRITON_SWIGLU_AVAILABLE:
         raise RuntimeError("Triton swiglu not available")
     from triton_swiglu import perf_swiglu
-    avg_time = perf_swiglu(x, weight, iterations=iterations)
-    return avg_time
+    avg_fwd_time, avg_bwd_time = perf_swiglu(x, weight, iterations=iterations)
+    return avg_fwd_time, avg_bwd_time
 
 def benchmark_swiglu_tma_triton(x, weight, iterations=100):
     # x: [B, in_features], weight: [in_features, 2*out_features]
     if not TRITON_SWIGLU_AVAILABLE:
         raise RuntimeError("Triton swiglu not available")
     from triton_tma_swiglu import perf_swiglu
-    avg_time = perf_swiglu(x, weight, iterations=iterations)
-    return avg_time
+    avg_fwd_time, avg_bwd_time = perf_swiglu(x, weight, iterations=iterations)
+    return avg_fwd_time, avg_bwd_time
 
 def benchmark_swiglu_torch(x, weight, iterations=100):
     # x: [B, in_features], weight: [in_features, 2*out_features]
     if not TORCH_SWIGLU_AVAILABLE:
         raise RuntimeError("Torch swiglu not available")
     # warmup
+    x_autograd = x.clone().requires_grad_()
+    w_autograd = weight.clone().requires_grad_()
     for _ in range(10):
-        torch_swiglu_ref(x, weight)
+        if x_autograd.grad is not None:
+            x_autograd.grad.zero_()
+        if w_autograd.grad is not None:
+            w_autograd.grad.zero_()
+        y = torch_swiglu_ref(x_autograd, w_autograd)
+        y.sum().backward()
     # run
     start = torch.cuda.Event(enable_timing=True)
+    mid = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize()
-    start.record()
+    fwd_cost = []
+    bwd_cost = []
     for _ in range(iterations):
-        torch_swiglu_ref(x, weight)
-    end.record()
-    torch.cuda.synchronize()
-    cost = start.elapsed_time(end)
-    return cost / iterations
+        x_autograd.grad.zero_()
+        w_autograd.grad.zero_()
+        torch.cuda.synchronize()
+        start.record()
+        y = torch_swiglu_ref(x_autograd, w_autograd)
+        mid.record()
+        y.sum().backward()
+        end.record()
+        torch.cuda.synchronize()
+        fwd_cost.append(start.elapsed_time(mid))
+        bwd_cost.append(mid.elapsed_time(end))
+    fwd_time = sum(fwd_cost) / iterations
+    bwd_time = sum(bwd_cost) / iterations
+    return fwd_time, bwd_time
 
 def benchmark(x, weight, iterations=100):
-    torch.set_grad_enabled(False)
-    cute_time = None
     triton_time = None
     print("-"*100)
     print(f"B={x.shape[0]}, in={x.shape[1]}, out={weight.shape[1]}, dtype={x.dtype}")
     if TRITON_SWIGLU_AVAILABLE:
-        triton_time = benchmark_swiglu_triton(x, weight, iterations=iterations)
-        print(f"Triton normal: {triton_time:.3f} ms")
-        triton_tma_time = benchmark_swiglu_tma_triton(x, weight, iterations=iterations)
-        print(f"Triton persistent TMA: {triton_tma_time:.3f} ms")
+        triton_fwd_time, triton_bwd_time = benchmark_swiglu_triton(x, weight, iterations=iterations)
+        print(f"Triton normal forward: {triton_fwd_time:.3f} ms, backward: {triton_bwd_time:.3f} ms")
+        triton_tma_fwd_time, triton_tma_bwd_time = benchmark_swiglu_tma_triton(x, weight, iterations=iterations)
+        print(f"Triton persistent TMA forward: {triton_tma_fwd_time:.3f} ms, backward: {triton_tma_bwd_time:.3f} ms")
     # if CUTE_AVAILABLE:
     #     cute_time = benchmark_swiglu_cute(x, weight.t(), iterations=iterations)
     #     print(f"CUTE: {cute_time:.3f} ms")
-    torch_time = benchmark_swiglu_torch(x, weight, iterations=iterations)
-    print(f"Torch: {torch_time:.3f} ms")
+    torch_fwd_time, torch_bwd_time = benchmark_swiglu_torch(x, weight, iterations=iterations)
+    print(f"Torch: {torch_fwd_time:.3f} ms, {torch_bwd_time:.3f} ms")
 
 def main():
     torch.manual_seed(0)
