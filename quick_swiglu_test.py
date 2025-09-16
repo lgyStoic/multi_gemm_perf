@@ -110,7 +110,31 @@ def benchmark(x, weight, iterations=100):
     torch_fwd_time, torch_bwd_time = benchmark_swiglu_torch(x, weight, iterations=iterations)
     print(f"Torch: {torch_fwd_time:.3f} ms, {torch_bwd_time:.3f} ms")
 
-def main():
+def profile_memory():
+    B = 4096
+    in_features = 4096
+    out_features = 4096 * 3
+    dtype = torch.float16
+
+    x = torch.randn(B, in_features, device="cuda", dtype=dtype)
+    weight = torch.randn(in_features, 2*out_features, device="cuda", dtype=dtype)
+
+    torch.cuda.reset_peak_memory_stats()
+    benchmark_swiglu_torch(x, weight, iterations=1)
+    peak_memory = torch.cuda.max_memory_allocated()
+    print(f"Torch swiglu peak memory: {peak_memory / 1024 / 1024:.3f} MB")
+
+    torch.cuda.reset_peak_memory_stats()
+    benchmark_swiglu_triton(x, weight, iterations=1)
+    peak_memory = torch.cuda.max_memory_allocated()
+    print(f"Triton swiglu peak memory: {peak_memory / 1024 / 1024:.3f} MB")
+
+    torch.cuda.reset_peak_memory_stats()
+    benchmark_swiglu_tma_triton(x, weight, iterations=1)
+    peak_memory = torch.cuda.max_memory_allocated()
+    print(f"Triton persistent TMA swiglu peak memory: {peak_memory / 1024 / 1024:.3f} MB")
+
+def speed_profile():
     torch.manual_seed(0)
     B = 4096
     in_features = 4096
@@ -138,7 +162,16 @@ def main():
         x = torch.randn(B, in_features, device="cuda", dtype=dtype)
         weight = torch.randn(in_features, 2*out_features, device="cuda", dtype=dtype)
         benchmark(x, weight)
+    
+    profile_memory(x, weight)
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", action="store_true")
+    args = parser.parse_args()
+    if args.profile:
+        profile_memory()
+    else:
+        speed_profile()
