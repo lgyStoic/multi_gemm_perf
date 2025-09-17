@@ -108,7 +108,7 @@ def benchmark(x, weight, iterations=100):
     #     cute_time = benchmark_swiglu_cute(x, weight.t(), iterations=iterations)
     #     print(f"CUTE: {cute_time:.3f} ms")
     torch_fwd_time, torch_bwd_time = benchmark_swiglu_torch(x, weight, iterations=iterations)
-    print(f"Torch: {torch_fwd_time:.3f} ms, {torch_bwd_time:.3f} ms")
+    print(f"Torch: forward {torch_fwd_time:.3f} ms, backward {torch_bwd_time:.3f} ms")
 
 def profile_memory():
     B = 4096
@@ -163,8 +163,6 @@ def speed_profile():
         weight = torch.randn(in_features, 2*out_features, device="cuda", dtype=dtype)
         benchmark(x, weight)
     
-    profile_memory(x, weight)
-
 
 if __name__ == "__main__":
     import argparse

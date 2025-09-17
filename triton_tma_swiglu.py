@@ -379,51 +379,39 @@ def calc_gemm(x_ptr, w_ptr, t_ptr,
         t = accumulator.to(tl.float16)
         t_desc.store([offs_am, offs_bn], t)
 
-@triton.autotune(
-    configs=[triton.Config({'GROUP_SIZE_M': g}) for g in [1, 2, 4, 8, 16, 32, 64]],
-    key=["M", "N", "N_2"],
-)
 @triton.jit
-def calc_t_swiglu_partial(t_ptr, grad_y_ptr, grad_swiglu_ptr,
+def calc_t_swiglu_partial_inplace(t_ptr,  grad_swiglu_ptr,
                                     M: tl.constexpr, 
                                     N: tl.constexpr, 
                                     N_2: tl.constexpr, 
-                                    POW_N_2: tl.constexpr,
-                                    GROUP_SIZE_M: tl.constexpr):
+                                    POW_N_2: tl.constexpr):
     """
-    calc t swiglu partial
+    calc t swiglu partial - simple inplace version (one row per thread)
     """
     pid = tl.program_id(axis=0)
+    
+    if pid >= M:
+        return
         
-    start_row = pid * GROUP_SIZE_M
-    end_row = min(M, start_row + GROUP_SIZE_M)
-    group_size = end_row - start_row
-    y1_ptr = t_ptr + start_row * N
-    y2_ptr = t_ptr + start_row * N + N_2
-    dy_dy1_ptr = grad_y_ptr + start_row * N
-    dy_dy2_ptr = grad_y_ptr + start_row * N + N_2
-    grad_swiglu_tmp_ptr = grad_swiglu_ptr + start_row * N_2
+    y1_ptr = t_ptr + pid * N
+    y2_ptr = t_ptr + pid * N + N_2
+    grad_swiglu_row_ptr = grad_swiglu_ptr + pid * N_2
+    
     offset_n2 = tl.arange(0, POW_N_2)
     mask_n2 = offset_n2 < N_2
 
-    for i in range(group_size):
-        y1 = tl.load(y1_ptr + offset_n2, mask=mask_n2)
-        y2 = tl.load(y2_ptr + offset_n2, mask=mask_n2)
-        grad_swiglu = tl.load(grad_swiglu_tmp_ptr + offset_n2, mask=mask_n2)
-        y2_sigmoid = tl.sigmoid(y2.to(tl.float32)).to(tl.float16)
-        p2 = y2 * y2_sigmoid
-        # Correct SwiGLU gradient computation:
-        # For y1: grad_swiglu * p2 (where p2 = y2 * sigmoid(y2))
-        # For y2: grad_swiglu * y1 * (sigmoid(y2) + y2 * sigmoid(y2) * (1 - sigmoid(y2)))
-        grad_y1 = p2 * grad_swiglu
-        tl.store(dy_dy1_ptr + offset_n2, grad_y1, mask=mask_n2)
-        grad_y2 = y1 * (y2_sigmoid + p2 * (1.0 - y2_sigmoid)) * grad_swiglu
-        tl.store(dy_dy2_ptr + offset_n2, grad_y2, mask=mask_n2)
-        y2_ptr += N
-        y1_ptr += N
-        dy_dy2_ptr += N
-        dy_dy1_ptr += N
-        grad_swiglu_tmp_ptr += N_2
+    y1 = tl.load(y1_ptr + offset_n2, mask=mask_n2)
+    y2 = tl.load(y2_ptr + offset_n2, mask=mask_n2)
+    grad_swiglu = tl.load(grad_swiglu_row_ptr + offset_n2, mask=mask_n2)
+    
+    y2_sigmoid = tl.sigmoid(y2.to(tl.float32)).to(tl.float16)
+    p2 = y2 * y2_sigmoid
+    
+    grad_y1 = p2 * grad_swiglu
+    grad_y2 = y1 * (y2_sigmoid + p2 * (1.0 - y2_sigmoid)) * grad_swiglu
+    
+    tl.store(y1_ptr + offset_n2, grad_y1, mask=mask_n2)
+    tl.store(y2_ptr + offset_n2, grad_y2, mask=mask_n2)
 
 @torch.library.custom_op("meshylearning::fused_linear_swiglu_grad", mutates_args=())
 def fused_linear_swiglu_grad(x: torch.Tensor,
@@ -439,7 +427,6 @@ def fused_linear_swiglu_grad(x: torch.Tensor,
     t = torch.zeros(M, N, device=device, dtype=torch.float16)
     grad_x = torch.zeros(M, K, device=device, dtype=torch.float16)
     grad_w = torch.zeros(K, N, device=device, dtype=torch.float16)
-    grad_dt = torch.zeros(M, N, device=device, dtype=torch.float16)
     def alloc_fn(size: int, alignment: int, stream: Optional[int]):
         return torch.empty(size, device=device, dtype=torch.int8)
     triton.set_allocator(alloc_fn)
@@ -449,17 +436,16 @@ def fused_linear_swiglu_grad(x: torch.Tensor,
         return (min(NUM_SMS, triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)), )
     calc_gemm[grid](x, w, t, M, N, K, "NN", NUM_SMS)
     def grid2(META):
-        GROUP_SIZE_M = META["GROUP_SIZE_M"]
-        return (triton.cdiv(M, GROUP_SIZE_M), )
+        return (M, )
     assert N % 2 == 0, "Matrix B must have an even number of columns"
     N_2 = N // 2
     POW_N_2 = triton.next_power_of_2(N_2)
-    calc_t_swiglu_partial[grid2](t, grad_dt, grad_swiglu.contiguous(), M, N, N_2, POW_N_2);
+    calc_t_swiglu_partial_inplace[grid2](t, grad_swiglu.contiguous(), M, N, N_2, POW_N_2);
     # Use PyTorch's built-in matrix multiplication for simplicity
     # grad_w = x.t() @ grad_dt  (K x M) @ (M x N) = (K x N)
-    calc_gemm[grid](x, grad_dt, grad_w, K, N, M, "TN", NUM_SMS)
+    calc_gemm[grid](x, t, grad_w, K, N, M, "TN", NUM_SMS)
     # grad_x = grad_dt @ w.t()  (M x N) @ (N x K) = (M x K)
-    calc_gemm[grid](grad_dt, w, grad_x, M, K, N, "NT", NUM_SMS)
+    calc_gemm[grid](t, w, grad_x, M, K, N, "NT", NUM_SMS)
     return grad_x, grad_w
 
 def _fused_linear_swiglu_backward(ctx, grad_swiglu):
@@ -519,6 +505,28 @@ def perf_swiglu(x: torch.Tensor,
     bwd_time = start.elapsed_time(end) / iterations
     return fwd_time, bwd_time
 
+def memory_profile_swiglu(x: torch.Tensor, w: torch.Tensor, iterations: int = 100):
+    torch.cuda.reset_peak_memory_stats()
+    for _ in range(iterations):
+        _fused_linear_swiglu(x, w)
+    peak_memory = torch.cuda.max_memory_allocated()
+    print(f"Triton persistent TMA swiglu peak memory: {peak_memory / 1024 / 1024:.3f} MB")
+
+    y = _fused_linear_swiglu(x, w)
+    torch.cuda.reset_peak_memory_stats()
+    for _ in range(iterations):
+        fused_linear_swiglu_grad(x, w, torch.ones_like(y))
+    peak_memory = torch.cuda.max_memory_allocated()
+    print(f"Triton persistent TMA swiglu backward peak memory: {peak_memory / 1024 / 1024:.3f} MB")
+
+    x_autograd = x.clone().requires_grad_()
+    w_autograd = w.clone().requires_grad_()
+    torch.cuda.reset_peak_memory_stats()
+    y = apply_fused_linear_swiglu(x_autograd, w_autograd)
+    y.sum().backward()
+    peak_memory = torch.cuda.max_memory_allocated()
+    print(f"Triton persistent TMA swiglu forward and backward peak memory: {peak_memory / 1024 / 1024:.3f} MB")
+
 def validate_swiglu(x: torch.Tensor, w: torch.Tensor):
     w_autograd = w.clone().requires_grad_()
     x_autograd = x.clone().requires_grad_()
@@ -531,48 +539,28 @@ def validate_swiglu(x: torch.Tensor, w: torch.Tensor):
     p2 = y2 * torch.sigmoid(y2)
     y_ref = y1 * p2
     assert torch.allclose(y, y_ref, atol=1e-2, rtol=1e-2)
-    y.sum().backward(retain_graph=True)
-
-    # with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], record_shapes=True, profile_memory=True) as prof:
-    #     y.sum().backward(retain_graph=True)
-    # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    y.sum().backward()
     y_ref.sum().backward()
+    # print(x_autograd.grad)
+    # print(x_autograd_1.grad)
+    # print(w_autograd.grad)
+    # print(w_autograd_1.grad)
     assert torch.allclose(x_autograd.grad, x_autograd_1.grad, atol=1.0, rtol=1e-1)
     assert torch.allclose(w_autograd.grad, w_autograd_1.grad, atol=1.0, rtol=1e-1)
 
 if __name__ == "__main__":
-    num = 512 
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", action="store_true", help="Run memory/profiler benchmarking")
+    parser.add_argument("--validate", action="store_true", help="Run correctness validation")
+    args = parser.parse_args()
+    num = 4096
     # torch.autograd.set_detect_anomaly(True)
     torch.manual_seed(0)
     x = torch.randn(num, num, device="cuda", dtype=torch.float16)
     w = torch.randn(num, num* 6, device="cuda", dtype=torch.float16)
-    validate_swiglu(x, w)
-    print("forward and backward passed")
-    # t = perf_swiglu(x, w)
-    # print(f"Triton persistent TMA: {t:.3f} ms")
-    #t_ref = torch.matmul(x, w)
-
-    #M, K = x.shape
-    #_, N = w.shape
-    #grad_x, grad_w = fused_linear_swiglu_grad(x, w, torch.ones(M, N, device="cuda", dtype=torch.float16))
-
-    #y1_ref, y2_ref = t_ref.chunk(2, dim=-1)
-    #sig_y2_ref = torch.sigmoid(y2_ref)
-    #one_minus_sigmoid_ref = 1.0 - sig_y2_ref
-    #p2_ref = y2_ref * sig_y2_ref
-    #product_ref = p2_ref * one_minus_sigmoid_ref
-    #o_ref = y1_ref * (sig_y2_ref + product_ref)
-    #dt_ref = torch.concat([p2_ref, o_ref], dim=-1)
-
-    #grad_x_ref = torch.matmul(dt_ref, w.t())
-    #grad_w_ref = torch.matmul(x.t(), dt_ref)
-    
-    ## Check if they're close (allow for small numerical differences)
-    ##print(grad_x_ref)
-    ##print(grad_x)
-    #assert torch.allclose(grad_w, grad_w_ref, atol=2.0, rtol=1e-2)
-    #assert torch.allclose(grad_x, grad_x_ref, atol=2.0, rtol=1e-2)
-    #print("backward passed")
-
-    ## assert torch.allclose(grad_x, grad_x_ref, atol=1e-2, rtol=1e-1)
-    ## assert torch.allclose(grad_w, grad_w_ref, atol=1e-2, rtol=1e-1)
+    if args.validate:
+        validate_swiglu(x, w)
+        print("forward and backward passed")
+    if args.profile:
+        memory_profile_swiglu(x, w)
