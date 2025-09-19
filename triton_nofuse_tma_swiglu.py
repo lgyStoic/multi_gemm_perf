@@ -5,10 +5,51 @@ from torch.library import triton_op
 from torch.library import wrap_triton
 from typing import Optional
 
+
+@triton.jit
+def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+def manual_configs():
+    configs = [triton.Config({"GROUP_SIZE_M": g, "BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n, "WARP_SPECIALIZE": ws}, num_stages=s, num_warps=w) 
+        for g in [1] 
+        for m in [2, 4] 
+        for n in [4096, 8192] 
+        for ws in [False, True] 
+        for s in [3, 4] 
+        for w in [16]]
+    configs2 = [triton.Config({"GROUP_SIZE_M": g, "BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n, "WARP_SPECIALIZE": ws}, num_stages=s, num_warps=w) 
+        for g in [1] 
+        for m in [4, 8] 
+        for n in [1024, 2048] 
+        for ws in [False, True] 
+        for s in [5,6] 
+        for w in [8]]
+    configs3 = [triton.Config({"GROUP_SIZE_M": g, "BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n, "WARP_SPECIALIZE": ws}, num_stages=s, num_warps=w) 
+        for g in [1] 
+        for m in [32] 
+        for n in [512] 
+        for ws in [False, True] 
+        for s in [5, 6] 
+        for w in [8]]
+    configs4 = [triton.Config({"GROUP_SIZE_M": g, "BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n, "WARP_SPECIALIZE": ws}, num_stages=s, num_warps=w) 
+        for g in [2] 
+        for m in [64, 128] 
+        for n in [64, 128, 256] 
+        for ws in [False, True] 
+        for s in [4,5] 
+        for w in [8, 16]]
+    configs = configs + configs2 + configs3 + configs4
+    return configs
+    
 # Forward kernel: computes out = x * silu(gate)
 @triton.autotune(
-    configs=[triton.Config({"BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n}) 
-        for m in [16,32,64,128] for n in [16,32,64,128]],
+    configs=manual_configs(),
     key=["M", "N"],
 )
 @triton.jit
@@ -17,11 +58,13 @@ def swiglu_fwd_kernel(
     out_ptr,  # pointer to output tensor, shape [B*L, D]
     M: tl.constexpr,
     N2: tl.constexpr,
+    NUM_SMS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    start_pid = tl.program_id(axis=0)
     N = N2 // 2
     x_desc = tl.make_tensor_descriptor(
         inp_ptr,
@@ -42,20 +85,33 @@ def swiglu_fwd_kernel(
         strides=[N, 1],
         block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
     )
+    
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_tiles = num_pid_m * num_pid_n
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    offs_am = pid_m * BLOCK_SIZE_M
-    offs_bn = pid_n * BLOCK_SIZE_N
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, warp_specialize=WARP_SPECIALIZE):
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
 
-    x = x_desc.load([offs_am, offs_bn])
-    gate = gate_desc.load([offs_am, offs_bn])
-    gate = gate * tl.sigmoid(gate.to(tl.float32)).to(tl.float16)
-    out = x * gate
-    out_desc.store([offs_am, offs_bn], out)
+        x = x_desc.load([offs_am, offs_bn])
+        gate = gate_desc.load([offs_am, offs_bn])
+        
+        # Ensure proper type handling for TMA
+        gate_fp32 = gate.to(tl.float32)
+        sig = tl.sigmoid(gate_fp32)
+        silu_fp32 = gate_fp32 * sig
+        silu = silu_fp32.to(gate.dtype)
+        
+        out = x * silu
+        out_desc.store([offs_am, offs_bn], out)
 
 # Backward kernel: computes gradients w.r.t. x and gate given grad_out.
 @triton.autotune(
     configs=[triton.Config({"BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n}) 
-        for m in [8, 16] for n in [64, 128, 256, 512]],
+        for m in [8, 16] for n in [16, 32, 64, 128, 256, 512]],
     key=["M", "N"],
 )
 @triton.jit
@@ -110,16 +166,26 @@ def swiglu_bwd_kernel(
 
     grad_out = grad_out_desc.load([offs_am, offs_bn])
 
-    y2_sigmoid = tl.sigmoid(y2.to(tl.float32)).to(tl.float16)
+    # Ensure proper type handling for TMA backward
+    y2_fp32 = y2.to(tl.float32)
+    sig = tl.sigmoid(y2_fp32)
+    y2_sigmoid = sig.to(y2.dtype)
+    
     silu = y2 * y2_sigmoid
     d_silu = y2_sigmoid + silu * (1.0 - y2_sigmoid)
+    
     grad_in_right = grad_out * y1 * d_silu
-    grad_in_left = grad_out * silu 
+    grad_in_left = grad_out * silu
+    
+    # Ensure output types match tensor descriptors
+    grad_in_left = grad_in_left.to(grad_in_left_desc.dtype)
+    grad_in_right = grad_in_right.to(grad_in_right_desc.dtype)
+    
     grad_in_left_desc.store([offs_am, offs_bn], grad_in_left)
     grad_in_right_desc.store([offs_am, offs_bn], grad_in_right)
 
-@triton_op("meshylearning::_swiglu", mutates_args=())
-def _swiglu(x: torch.Tensor) -> torch.Tensor:
+@triton_op("meshylearning::_swiglu_tma", mutates_args=())
+def _swiglu_tma(x: torch.Tensor) -> torch.Tensor:
     torch._check(x.is_contiguous(), "Input to triton SwiGLU must be contiguous")
     L, D2 = x.shape
     torch._check(
@@ -131,18 +197,19 @@ def _swiglu(x: torch.Tensor) -> torch.Tensor:
     def grid(META):
         BLOCK_M = META["BLOCK_SIZE_M"]
         BLOCK_N = META["BLOCK_SIZE_N"]
-        return (triton.cdiv(L, BLOCK_M), triton.cdiv(D2, BLOCK_N), )
+        return (min(NUM_SMS * 2, triton.cdiv(L, BLOCK_M) * triton.cdiv(D2, BLOCK_N)),)
     
     def alloc_fn(size: int, alignment: int, stream: Optional[int]):
         return torch.empty(size, device=x.device, dtype=torch.int8)
     triton.set_allocator(alloc_fn)
 
-    wrap_triton(swiglu_fwd_kernel)[grid](x, out, L, D2)
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    wrap_triton(swiglu_fwd_kernel)[grid](x, out, L, D2, NUM_SMS)
 
     return out
 
-@triton_op("meshylearning::_swiglu_bwd", mutates_args=())
-def _swiglu_bwd(grad_Y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+@triton_op("meshylearning::_swiglu_bwd_tma", mutates_args=())
+def _swiglu_bwd_tma(grad_Y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     L, D = grad_Y.shape
     D2 = D * 2
     grad_x = torch.empty((L, D2), dtype=x.dtype, device=x.device)
@@ -162,7 +229,7 @@ def _swiglu_bwd(grad_Y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
 
 def swiglu(x: torch.Tensor) -> torch.Tensor:
     x_shape = x.shape
-    return _swiglu(x.flatten(0, -2).contiguous()).view(*x_shape[:-1], -1)
+    return _swiglu_tma(x.flatten(0, -2).contiguous()).view(*x_shape[:-1], -1)
 
 
 def _swiglu_setup_context(ctx, inputs, output):
@@ -172,10 +239,10 @@ def _swiglu_setup_context(ctx, inputs, output):
 
 def _swiglu_backward(ctx, grad_Y):
     (x,) = ctx.saved_tensors
-    return _swiglu_bwd(grad_Y, x)
+    return _swiglu_bwd_tma(grad_Y, x)
 
 
-_swiglu.register_autograd(
+_swiglu_tma.register_autograd(
     _swiglu_backward,
     setup_context=_swiglu_setup_context,
 )
@@ -192,7 +259,7 @@ def perf_swiglu(x, iterations=100):
     # Forward pass warmup
     for _ in range(warmup_iterations):
         x_autograd = x.clone().requires_grad_()
-        y = _swiglu(x_autograd)
+        y = _swiglu_tma(x_autograd)
     
     # Forward pass performance test
     torch.cuda.synchronize()
@@ -203,7 +270,7 @@ def perf_swiglu(x, iterations=100):
     torch.cuda.synchronize()
     start.record()
     for _ in range(iterations):
-        y = _swiglu(x_autograd)
+        y = _swiglu_tma(x_autograd)
     end.record()
     end.synchronize()
     avg_fwd_time = start.elapsed_time(end) / iterations
@@ -213,13 +280,13 @@ def perf_swiglu(x, iterations=100):
     
     # Backward pass warmup
     for _ in range(warmup_iterations):
-        _swiglu_bwd(grad_y, x_autograd)
+        _swiglu_bwd_tma(grad_y, x_autograd)
     
     # Backward pass performance test
     torch.cuda.synchronize()
     start.record()
     for _ in range(iterations):
-        _swiglu_bwd(grad_y, x_autograd)
+        _swiglu_bwd_tma(grad_y, x_autograd)
     end.record()
     end.synchronize()
     avg_bwd_time = start.elapsed_time(end) / iterations
