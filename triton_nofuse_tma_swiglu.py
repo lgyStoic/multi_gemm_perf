@@ -16,35 +16,14 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
     return pid_m, pid_n
 
 def manual_configs():
-    configs = [triton.Config({"GROUP_SIZE_M": g, "BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n, "WARP_SPECIALIZE": ws}, num_stages=s, num_warps=w) 
+    configs = [triton.Config({"GROUP_SIZE_M": g, "BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n, "WARP_SPECIALIZE": ws}, num_warps=w, num_stages=s, num_ctas=c) 
         for g in [1] 
-        for m in [2, 4] 
-        for n in [4096, 8192] 
+        for m in [8, 16, 32] 
+        for n in [128, 256, 512, 1024] 
         for ws in [False, True] 
-        for s in [3, 4] 
-        for w in [16]]
-    configs2 = [triton.Config({"GROUP_SIZE_M": g, "BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n, "WARP_SPECIALIZE": ws}, num_stages=s, num_warps=w) 
-        for g in [1] 
-        for m in [4, 8] 
-        for n in [1024, 2048] 
-        for ws in [False, True] 
-        for s in [5,6] 
-        for w in [8]]
-    configs3 = [triton.Config({"GROUP_SIZE_M": g, "BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n, "WARP_SPECIALIZE": ws}, num_stages=s, num_warps=w) 
-        for g in [1] 
-        for m in [32] 
-        for n in [512] 
-        for ws in [False, True] 
-        for s in [5, 6] 
-        for w in [8]]
-    configs4 = [triton.Config({"GROUP_SIZE_M": g, "BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n, "WARP_SPECIALIZE": ws}, num_stages=s, num_warps=w) 
-        for g in [2] 
-        for m in [64, 128] 
-        for n in [64, 128, 256] 
-        for ws in [False, True] 
-        for s in [4,5] 
-        for w in [8, 16]]
-    configs = configs + configs2 + configs3 + configs4
+        for w in [4, 8]
+        for s in [2,3]
+        for c in [1]]
     return configs
     
 # Forward kernel: computes out = x * silu(gate)
@@ -91,7 +70,7 @@ def swiglu_fwd_kernel(
     num_tiles = num_pid_m * num_pid_n
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, warp_specialize=WARP_SPECIALIZE):
+    for tile_id in tl.range(start_pid, num_tiles, tl.num_programs(0), warp_specialize=WARP_SPECIALIZE):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
@@ -197,7 +176,11 @@ def _swiglu_tma(x: torch.Tensor) -> torch.Tensor:
     def grid(META):
         BLOCK_M = META["BLOCK_SIZE_M"]
         BLOCK_N = META["BLOCK_SIZE_N"]
-        return (min(NUM_SMS * 2, triton.cdiv(L, BLOCK_M) * triton.cdiv(D2, BLOCK_N)),)
+        if triton.cdiv(L, BLOCK_M) * triton.cdiv(D, BLOCK_N) >= 8 * NUM_SMS:
+            grid = (8 * NUM_SMS, )
+        else:
+            grid = (min(triton.cdiv(L, BLOCK_M) * triton.cdiv(D, BLOCK_N), 4 * NUM_SMS), )
+        return grid
     
     def alloc_fn(size: int, alignment: int, stream: Optional[int]):
         return torch.empty(size, device=x.device, dtype=torch.int8)

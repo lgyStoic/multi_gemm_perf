@@ -3,19 +3,19 @@ import torch
 
 @tt.perf_report(
     tt.Benchmark(
-        x_names=["M", "N"],
-        x_vals= [2**i for i in range(10, 15)],
+        x_names=["M"],
+        x_vals= [2**i for i in range(15, 21)],
         line_arg="provider",
         line_vals=["triton", "triton_tma"],
         line_names=["Triton", "Triton TMA"],
         styles=[("green", "-"), ("blue", "-")],
         ylabel="GB/s",
         plot_name="nofuse-swiglu-performance",
-        args={},
+        args={"N": 384},
     )
 )
 def benchmark(M, N, provider):
-    x = torch.randn((M, N*2), device='cuda', dtype=torch.float16)
+    x = torch.randn((M, N), device='cuda', dtype=torch.float16)
     if provider == "triton":
         from triton_nofuse_swiglu import _swiglu
         ms = tt.do_bench(lambda: _swiglu(x))
