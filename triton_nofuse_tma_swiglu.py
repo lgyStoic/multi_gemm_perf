@@ -103,9 +103,12 @@ def swiglu_bwd_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
     N = N2 // 2
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_tiles = num_pid_m * num_pid_n
+
     y1_desc = tl.make_tensor_descriptor(
         inp_ptr,
         shape=[M, N],
@@ -137,31 +140,34 @@ def swiglu_bwd_kernel(
         block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
     )
 
-    offs_am = pid_m * BLOCK_SIZE_M
-    offs_bn = pid_n * BLOCK_SIZE_N
+    for tile_id in tl.range(start_pid, num_tiles, tl.num_programs(0)):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
 
-    y1 = y1_desc.load([offs_am, offs_bn])
-    y2 = y2_desc.load([offs_am, offs_bn])
+        y1 = y1_desc.load([offs_am, offs_bn])
+        y2 = y2_desc.load([offs_am, offs_bn])
 
-    grad_out = grad_out_desc.load([offs_am, offs_bn])
+        grad_out = grad_out_desc.load([offs_am, offs_bn])
 
-    # Ensure proper type handling for TMA backward
-    y2_fp32 = y2.to(tl.float32)
-    sig = tl.sigmoid(y2_fp32)
-    y2_sigmoid = sig.to(y2.dtype)
+        # Ensure proper type handling for TMA backward
+        y2_fp32 = y2.to(tl.float32)
+        sig = tl.sigmoid(y2_fp32)
+        y2_sigmoid = sig.to(y2.dtype)
     
-    silu = y2 * y2_sigmoid
-    d_silu = y2_sigmoid + silu * (1.0 - y2_sigmoid)
+        silu = y2 * y2_sigmoid
+        d_silu = y2_sigmoid + silu * (1.0 - y2_sigmoid)
     
-    grad_in_right = grad_out * y1 * d_silu
-    grad_in_left = grad_out * silu
+        grad_in_right = grad_out * y1 * d_silu
+        grad_in_left = grad_out * silu
     
-    # Ensure output types match tensor descriptors
-    grad_in_left = grad_in_left.to(grad_in_left_desc.dtype)
-    grad_in_right = grad_in_right.to(grad_in_right_desc.dtype)
+        # Ensure output types match tensor descriptors
+        grad_in_left = grad_in_left.to(grad_in_left_desc.dtype)
+        grad_in_right = grad_in_right.to(grad_in_right_desc.dtype)
     
-    grad_in_left_desc.store([offs_am, offs_bn], grad_in_left)
-    grad_in_right_desc.store([offs_am, offs_bn], grad_in_right)
+        grad_in_left_desc.store([offs_am, offs_bn], grad_in_left)
+        grad_in_right_desc.store([offs_am, offs_bn], grad_in_right)
 
 @triton_op("meshylearning::_swiglu_tma", mutates_args=())
 def _swiglu_tma(x: torch.Tensor) -> torch.Tensor:
@@ -198,12 +204,16 @@ def _swiglu_bwd_tma(grad_Y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     grad_x = torch.empty((L, D2), dtype=x.dtype, device=x.device)
 
     grad_Y = grad_Y.contiguous()
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     def grid(META):
         BLOCK_M = META["BLOCK_SIZE_M"]
         BLOCK_N = META["BLOCK_SIZE_N"]
-        return (triton.cdiv(L, BLOCK_M), triton.cdiv(D, BLOCK_N), )
-
+        if triton.cdiv(L, BLOCK_M) * triton.cdiv(D, BLOCK_N) >= 8 * NUM_SMS:
+            grid = (8 * NUM_SMS, )
+        else:
+            grid = (min(triton.cdiv(L, BLOCK_M) * triton.cdiv(D, BLOCK_N), 4 * NUM_SMS), )
+        return grid
     wrap_triton(swiglu_bwd_kernel)[grid](
         grad_Y, x, grad_x, L, D2
     )
