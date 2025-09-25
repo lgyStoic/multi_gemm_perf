@@ -16,8 +16,8 @@ from typing import Optional
     triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "WARP_SPECIALIZE": True}, num_warps=8, num_stages=2),
     triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 512, "WARP_SPECIALIZE": False}, num_warps=4, num_stages=2),
     triton.Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 512, "WARP_SPECIALIZE": True}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 1024, "WARP_SPECIALIZE": False}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 1024, "WARP_SPECIALIZE": True}, num_warps=8, num_stages=2)
+    # triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 1024, "WARP_SPECIALIZE": False}, num_warps=8, num_stages=2),
+    # triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 1024, "WARP_SPECIALIZE": True}, num_warps=8, num_stages=2)
     ],
     key=["M", "N2"],
 )
@@ -76,26 +76,6 @@ def swiglu_tma_fwd_kernel(
         out_desc.store([offs_am, offs_bn], out)
 
 
-# Backward kernel: computes gradients w.r.t. x and gate given grad_out.
-# @triton.autotune(
-#     configs=[
-#     # triton.Config({"BLOCK_SIZE_M": 2, "BLOCK_SIZE_N": 1024, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=2, num_ctas=1),
-#     # triton.Config({"BLOCK_SIZE_M": 4, "BLOCK_SIZE_N": 1024, "WARP_SPECIALIZE": False}, num_warps=8, num_stages=2, num_ctas=2),
-#     # triton.Config({"BLOCK_SIZE_M": 4, "BLOCK_SIZE_N": 2048, "WARP_SPECIALIZE": False}, num_warps=4, num_stages=2, num_ctas=2),
-#     # triton.Config({"BLOCK_SIZE_M": 2, "BLOCK_SIZE_N": 2048, "WARP_SPECIALIZE": False}, num_warps=4, num_stages=2, num_ctas=2),
-#     # triton.Config({"BLOCK_SIZE_M": 4, "BLOCK_SIZE_N": 256, "WARP_SPECIALIZE": False}, num_warps=4, num_stages=2, num_ctas=2),
-#     # triton.Config({"BLOCK_SIZE_M": 8, "BLOCK_SIZE_N": 256, "WARP_SPECIALIZE": False}, num_warps=8, num_stages=2, num_ctas=2),
-#     # triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 256, "WARP_SPECIALIZE": False}, num_warps=8, num_stages=2, num_ctas=2),
-#     # triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=2, num_ctas=1),
-#     # triton.Config({"BLOCK_SIZE_M": 8, "BLOCK_SIZE_N": 64, "WARP_SPECIALIZE": False}, num_warps=4, num_stages=2, num_ctas=2),
-#     # triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "WARP_SPECIALIZE": False}, num_warps=4, num_stages=2, num_ctas=1),
-#     triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=2, num_ctas=1),
-#     # triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "WARP_SPECIALIZE": True}, num_warps=8, num_stages=2, num_ctas=2),
-#     # triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64, "WARP_SPECIALIZE": True}, num_warps=8, num_stages=2, num_ctas=1),
-
-#     ],
-#     key=["M", "N"],
-# )
 @triton.jit
 def swiglu_bwd_kernel(
     grad_out_ptr,  # pointer to grad output tensor, shape [B*L, D]
