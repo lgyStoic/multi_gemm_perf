@@ -5,54 +5,39 @@ import triton.language as tl
 from torch.library import triton_op
 from torch.library import wrap_triton
 from typing import Optional
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 
 # Forward kernel: computes out = x * silu(gate)
-@triton.autotune(
-    configs=[
-    triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 256, "WARP_SPECIALIZE": False}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 256, "WARP_SPECIALIZE": False}, num_warps=8, num_stages=3, num_ctas=2),
-    triton.Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 256, "WARP_SPECIALIZE": True}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "WARP_SPECIALIZE": True}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 512, "WARP_SPECIALIZE": False}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 512, "WARP_SPECIALIZE": True}, num_warps=8, num_stages=2),
-    # triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 1024, "WARP_SPECIALIZE": False}, num_warps=8, num_stages=2),
-    # triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 1024, "WARP_SPECIALIZE": True}, num_warps=8, num_stages=2)
-    ],
-    key=["M", "N2"],
-)
+#@triton.autotune(
+#    configs=[
+#    triton.Config({"BLOCK_SIZE_M": 1024, "BLOCK_SIZE_N": 384, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=3),
+#    triton.Config({"BLOCK_SIZE_M": 1024, "BLOCK_SIZE_N": 384, "WARP_SPECIALIZE": False}, num_warps=4, num_stages=3, num_ctas=2),
+#    triton.Config({"BLOCK_SIZE_M": 2048, "BLOCK_SIZE_N": 384, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=3),
+#    triton.Config({"BLOCK_SIZE_M": 2048, "BLOCK_SIZE_N": 384, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=3),
+#    triton.Config({"BLOCK_SIZE_M": 4096, "BLOCK_SIZE_N": 384, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=4),
+#    triton.Config({"BLOCK_SIZE_M": 4096, "BLOCK_SIZE_N": 384, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=4),
+#    triton.Config({"BLOCK_SIZE_M": 8192, "BLOCK_SIZE_N": 384, "WARP_SPECIALIZE": False}, num_warps=4, num_stages=3),
+#    triton.Config({"BLOCK_SIZE_M": 8192, "BLOCK_SIZE_N": 384, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=2),
+#    triton.Config({"BLOCK_SIZE_M": 8192, "BLOCK_SIZE_N": 384, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=3),
+#    triton.Config({"BLOCK_SIZE_M": 8192, "BLOCK_SIZE_N": 384, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=4),
+#    triton.Config({"BLOCK_SIZE_M": 16384, "BLOCK_SIZE_N": 384, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=3),
+#    triton.Config({"BLOCK_SIZE_M": 32768, "BLOCK_SIZE_N": 384, "WARP_SPECIALIZE": True}, num_warps=4, num_stages=4),
+#    ],
+#    key=["M", "N2"],
+#)
 @triton.jit
 def swiglu_tma_fwd_kernel(
-    inp_ptr,  # pointer to input tensor, shape [B*L, 2*D]
-    out_ptr,  # pointer to output tensor, shape [B*L, D]
+    x_desc,
+    gate_desc,
+    out_desc,
     M: tl.constexpr,
-    N2: tl.constexpr,
+    N: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr,
 ):
     start_pid = tl.program_id(axis=0)
-    N = N2 // 2
-    x_desc = tl.make_tensor_descriptor(
-        inp_ptr,
-        shape=[M, N],
-        strides=[N2, 1],
-        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-    )
-    gate_desc = tl.make_tensor_descriptor(
-        inp_ptr + N,
-        shape=[M, N],
-        strides=[N2, 1],
-        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-    )
-
-    out_desc = tl.make_tensor_descriptor(
-        out_ptr,
-        shape=[M, N],
-        strides=[N, 1],
-        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-    )
-    
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     num_tiles = num_pid_m * num_pid_n
@@ -74,7 +59,6 @@ def swiglu_tma_fwd_kernel(
         
         out = x * silu
         out_desc.store([offs_am, offs_bn], out)
-
 
 @triton.jit
 def swiglu_bwd_kernel(
@@ -124,20 +108,20 @@ def _swiglu_tma(x: torch.Tensor) -> torch.Tensor:
 
     out = torch.empty((L, D), dtype=x.dtype, device=x.device)
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    BLOCK_M = 16
+    BLOCK_N = 16
+    x_desc = TensorDescriptor.from_tensor(x, [BLOCK_M, BLOCK_N])
+    gate_desc = TensorDescriptor.from_tensor(x + D, [BLOCK_M, BLOCK_N])
+    out_desc = TensorDescriptor.from_tensor(out, [BLOCK_M, BLOCK_N])
+    grid = (triton.cdiv(L, BLOCK_M) * triton.cdiv(D, BLOCK_N), )
     def grid(META):
-        BLOCK_M = META["BLOCK_SIZE_M"]
-        BLOCK_N = META["BLOCK_SIZE_N"]
-        if triton.cdiv(L, BLOCK_M) * triton.cdiv(D, BLOCK_N) >= 8 * NUM_SMS:
-            grid = (8 * NUM_SMS, )
+        if triton.cdiv(L, BLOCK_M) * triton.cdiv(D, BLOCK_N) >= 4 * NUM_SMS:
+            grid = (4 * NUM_SMS, )
         else:
-            grid = (min(triton.cdiv(L, BLOCK_M) * triton.cdiv(D, BLOCK_N), 4 * NUM_SMS), )
+            grid = (triton.cdiv(L, BLOCK_M) * triton.cdiv(D, BLOCK_N), )
         return grid
-    
-    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
-        return torch.empty(size, device=x.device, dtype=torch.int8)
-    triton.set_allocator(alloc_fn)
 
-    wrap_triton(swiglu_tma_fwd_kernel)[grid](x, out, L, D2)
+    wrap_triton(swiglu_tma_fwd_kernel)[grid](x_desc, gate_desc, out_desc, L, D, BLOCK_M, BLOCK_N, True)
 
     return out
 
