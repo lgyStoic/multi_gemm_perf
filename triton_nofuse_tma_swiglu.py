@@ -108,10 +108,11 @@ def _swiglu_tma(x: torch.Tensor) -> torch.Tensor:
 
     out = torch.empty((L, D), dtype=x.dtype, device=x.device)
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    BLOCK_M = 16
-    BLOCK_N = 16
-    x_desc = TensorDescriptor.from_tensor(x, [BLOCK_M, BLOCK_N])
-    gate_desc = TensorDescriptor.from_tensor(x + D, [BLOCK_M, BLOCK_N])
+    BLOCK_M = 256
+    BLOCK_N = 32
+    x1, x2 = torch.split(x, D, dim=-1)
+    x_desc = TensorDescriptor.from_tensor(x1, [BLOCK_M, BLOCK_N])
+    gate_desc = TensorDescriptor.from_tensor(x2, [BLOCK_M, BLOCK_N])
     out_desc = TensorDescriptor.from_tensor(out, [BLOCK_M, BLOCK_N])
     grid = (triton.cdiv(L, BLOCK_M) * triton.cdiv(D, BLOCK_N), )
     def grid(META):
@@ -225,15 +226,15 @@ if __name__ == "__main__":
     # Create the same random tensor for both implementations
     x_data = torch.randn(1, 2 ** 20, 384, dtype=torch.float16, device="cuda")
     x = x_data.clone().requires_grad_()
-    # x_ref = x_data.clone().requires_grad_()
-    # y_ref = ref_swiglu(x_ref)
+    x_ref = x_data.clone().requires_grad_()
+    y_ref = ref_swiglu(x_ref)
     y_triton = swiglu(x)
     target = torch.ones_like(y_triton)
     torch.nn.functional.mse_loss(y_triton, target).backward()
-    # torch.nn.functional.mse_loss(y_ref, target).backward()
-    # print(y_triton)
-    # print("==========")
-    # print(y_ref)
-    # assert torch.allclose(y_triton, y_ref, atol=1e-1)
-    # assert torch.allclose(x.grad, x_ref.grad, atol=1e-1)
+    torch.nn.functional.mse_loss(y_ref, target).backward()
+    print(y_triton)
+    print("==========")
+    print(y_ref)
+    assert torch.allclose(y_triton, y_ref, atol=1e-1)
+    assert torch.allclose(x.grad, x_ref.grad, atol=1e-1)
     print("passed")

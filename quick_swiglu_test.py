@@ -59,6 +59,24 @@ def benchmark_swiglu_tma_triton(x, weight, iterations=100):
     avg_fwd_time, avg_bwd_time = perf_swiglu(x, weight, iterations=iterations)
     return avg_fwd_time, avg_bwd_time
 
+def benchmark_swiglu_nofuse_tma_triton(x, weight, iterations=100):
+    # x: [B, in_features], weight: [in_features, 2*out_features]
+    if not TRITON_SWIGLU_AVAILABLE:
+        raise RuntimeError("Triton swiglu not available")
+    from triton_nofuse_tma_swiglu import perf_swiglu
+    b = torch.matmul(x, weight)
+    avg_fwd_time, avg_bwd_time = perf_swiglu(b, iterations=iterations)
+    return avg_fwd_time, avg_bwd_time
+
+def benchmark_swiglu_nofuse_triton(x, weight, iterations=100):
+    # x: [B, in_features], weight: [in_features, 2*out_features]
+    if not TRITON_SWIGLU_AVAILABLE:
+        raise RuntimeError("Triton swiglu not available")
+    from triton_nofuse_swiglu import perf_swiglu
+    b = torch.matmul(x, weight)
+    avg_fwd_time, avg_bwd_time = perf_swiglu(b, iterations=iterations)
+    return avg_fwd_time, avg_bwd_time
+
 def benchmark_swiglu_torch(x, weight, iterations=100):
     # x: [B, in_features], weight: [in_features, 2*out_features]
     if not TORCH_SWIGLU_AVAILABLE:
@@ -95,20 +113,30 @@ def benchmark_swiglu_torch(x, weight, iterations=100):
     bwd_time = sum(bwd_cost) / iterations
     return fwd_time, bwd_time
 
-def benchmark(x, weight, iterations=100):
+def benchmark(x, weight, iterations=100, no_fuse = True):
     triton_time = None
     print("-"*100)
     print(f"B={x.shape[0]}, in={x.shape[1]}, out={weight.shape[1]}, dtype={x.dtype}")
-    if TRITON_SWIGLU_AVAILABLE:
-        triton_fwd_time, triton_bwd_time = benchmark_swiglu_triton(x, weight, iterations=iterations)
-        print(f"Triton normal forward: {triton_fwd_time:.3f} ms, backward: {triton_bwd_time:.3f} ms")
-        triton_tma_fwd_time, triton_tma_bwd_time = benchmark_swiglu_tma_triton(x, weight, iterations=iterations)
-        print(f"Triton persistent TMA forward: {triton_tma_fwd_time:.3f} ms, backward: {triton_tma_bwd_time:.3f} ms")
-    # if CUTE_AVAILABLE:
-    #     cute_time = benchmark_swiglu_cute(x, weight.t(), iterations=iterations)
-    #     print(f"CUTE: {cute_time:.3f} ms")
-    torch_fwd_time, torch_bwd_time = benchmark_swiglu_torch(x, weight, iterations=iterations)
-    print(f"Torch: forward {torch_fwd_time:.3f} ms, backward {torch_bwd_time:.3f} ms")
+    if not no_fuse:
+        if TRITON_SWIGLU_AVAILABLE:
+            triton_fwd_time, triton_bwd_time = benchmark_swiglu_triton(x, weight, iterations=iterations)
+            print(f"Triton normal forward: {triton_fwd_time:.3f} ms, backward: {triton_bwd_time:.3f} ms")
+            triton_tma_fwd_time, triton_tma_bwd_time = benchmark_swiglu_tma_triton(x, weight, iterations=iterations)
+            print(f"Triton persistent TMA forward: {triton_tma_fwd_time:.3f} ms, backward: {triton_tma_bwd_time:.3f} ms")
+
+            
+        # if CUTE_AVAILABLE:
+        #     cute_time = benchmark_swiglu_cute(x, weight.t(), iterations=iterations)
+        #     print(f"CUTE: {cute_time:.3f} ms")
+        torch_fwd_time, torch_bwd_time = benchmark_swiglu_torch(x, weight, iterations=iterations)
+        print(f"Torch: forward {torch_fwd_time:.3f} ms, backward {torch_bwd_time:.3f} ms")
+    else:
+        if TRITON_SWIGLU_AVAILABLE:
+            print("--------Triton nofuse--------")
+            triton_nofuse_fwd_time, triton_nofuse_bwd_time = benchmark_swiglu_nofuse_triton(x, weight, iterations=iterations)
+            print(f"Triton nofuse forward: {triton_nofuse_fwd_time:.3f} ms, backward: {triton_nofuse_bwd_time:.3f} ms")
+            triton_nofuse_tma_fwd_time, triton_nofuse_tma_bwd_time = benchmark_swiglu_nofuse_tma_triton(x, weight, iterations=iterations)
+            print(f"Triton nofuse persistent TMA forward: {triton_nofuse_tma_fwd_time:.3f} ms, backward: {triton_nofuse_tma_bwd_time:.3f} ms")
 
 def profile_memory():
     B = 4096
@@ -147,20 +175,53 @@ def speed_profile():
     print(f"Testing SWIGLU performance: B={B}, in={in_features}, out={out_features}, dtype={dtype}")
 
     # Benchmark multiple shapes
-    shapes = [
-        (4096, 4096, 4096 * 3),
-        (2048, 4096, 4096 * 3),
-        (4096, 2048, 2048 * 3),
-        (1024, 1024, 1024 * 3),
-        (512, 4096, 4096 * 3),
-        (4096, 512, 512 * 3),
-        (8192, 4096, 4096 * 3),
-        (4096, 8192, 8192 * 3),
-    ]
+    shapes = []
+    for i in [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152]:
+        for j in [384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024]:
+            shapes.append((i, j))
+
+    # shapes = [
+    #     (4096, 384),
+    #     (8192, 384),
+    #     (16384, 384),
+    #     (32768, 384),
+    #     (65536, 384),
+    #     (131072, 384),
+    #     (262144, 384),
+    #     (524288, 384),
+    #     (1048576, 384),
+    #     (2097152, 384),
+    #     (4096, 448),
+    #     (8192, 448),
+    #     (16384, 448),
+    #     (32768, 448),
+    #     (65536, 448),
+    #     (131072, 448),
+    #     (262144, 448),
+    #     (524288, 448),
+    #     (1048576, 448),
+    #     (2097152, 448),
+    #     (16384, 768),
+    #     (32768, 768),
+    #     (65536, 768),
+    #     (131072, 768),
+    #     (262144, 768),
+    #     (524288, 768),
+    #     (1048576, 768),
+    #     (2097152, 768),
+    #     (32768, 1024),
+    #     (65536, 1024),
+    #     (131072, 1024),
+    #     (262144, 1024),
+    #     (524288, 1024),
+    #     (1048576, 1024),
+    #     (2097152, 1024),
+    # ]
     dtype = torch.float16
-    for B, in_features, out_features in shapes:
-        x = torch.randn(B, in_features, device="cuda", dtype=dtype)
-        weight = torch.randn(in_features, 2*out_features, device="cuda", dtype=dtype)
+    for seq_len, d_ff in shapes:
+        d_model = d_ff // 6
+        x = torch.randn(seq_len, d_model, device="cuda", dtype=dtype)
+        weight = torch.randn(d_model, d_ff, device="cuda", dtype=dtype)
         benchmark(x, weight)
     
 
